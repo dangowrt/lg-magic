@@ -18,6 +18,13 @@ This project provides a comprehensive Linux kernel driver and toolset for the LG
 - **kernel/Makefile** - Build system for the kernel module
 - **51-lgimu.rules** - Udev rule for non-root raw IMU access. Place to `/etc/udev/rules.d/` if needed.
 
+### Voice Bridge
+
+- **voice/lg_magic_voice.c** - Microphone bridge: reads mSBC audio from the remote over hidraw and publishes it as a PipeWire source
+- **voice/Makefile** - Build and install the bridge
+- **voice/lg-magic-voice.service** - systemd user unit for the bridge
+- **52-lgmagic-hidraw.rules** - Udev rule granting the logged-in user access to the remote's hidraw node, required by the bridge
+
 ### Python Tools
 
 - **scripts/lg_magic.py** - HIDRAW-level packet analyzer and debug tool. Initial tool, kept for historical reasons
@@ -28,7 +35,9 @@ This project provides a comprehensive Linux kernel driver and toolset for the LG
 ## Kernel Module Features
 
 ### Device Support
-- Supports LG Magic Remote (HID Bluetooth device 000f:3412)
+- Supports LG Magic Remote (HID Bluetooth device 000f:3412, genuine MR18, MR19
+  and MR20 firmware; the 2025 MR25 generation reports 005d:8762 and is not
+  matched)
 - Creates two input devices:
   - `LG Magic Remote` - Standard HID events (buttons, wheel, airmouse)
   - `LG Magic Remote IMU` - Raw IMU data (accelerometer + gyroscope)
@@ -39,6 +48,19 @@ Comprehensive button support including:
 - Media controls (PLAY, PAUSE, VOLUME, MUTE)
 - Color buttons (RED, GREEN, YELLOW, BLUE)
 - Special function buttons (HOME, BACK, SETTINGS, GUIDE)
+
+### Voice Input
+- Microphone audio is mSBC on HID input report `0xFE` and is bridged into
+  PipeWire by `voice/lg-magic-voice`, not by the kernel module
+- The kernel module reports the microphone button as `KEY_VOICECOMMAND` and
+  leaves the audio to the hidraw reader
+
+### Device Interrogation
+- Motion streaming is enabled at probe and after resume with the vendor command
+  `F9 01`; without it the gyro and accelerometer fields are not populated
+- Firmware version, region zone and the remote's own sensor calibration blob
+  (SCD) are requested at probe and exposed through sysfs
+- Battery level is decoded from the upper six bits of report byte 3
 
 ### Airmouse Functionality
 **Needs calibration before usage**
@@ -83,7 +105,8 @@ The driver supports several runtime parameters:
 
 ```bash
 # Load with custom parameters
-sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 imu_evdev=1 debug=2
+sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 imu_evdev=1 \
+              motion=1 debug=2
 
 # Or set via sysfs after loading
 echo 1 > /sys/module/lg_magic/parameters/airmouse
@@ -95,7 +118,22 @@ echo 2 > /sys/module/lg_magic/parameters/debug
 - `airmouse` (0/1): Enable/disable airmouse functionality
 - `airmouse_threshold` (int): Gyro threshold for enabling airmouse (default: 300)
 - `imu_evdev` (0/1): Expose raw IMU data as separate input device
+- `motion` (0/1): Ask the remote to stream motion samples (default: 1)
 - `debug` (0-2): Debug message level (0=quiet, 1=normal, 2=verbose)
+
+### Sysfs Attributes
+
+Under the HID device directory, for example
+`/sys/bus/hid/devices/0005:000F:3412.*/`:
+
+- `fw_version`: firmware version string reported by the remote
+- `fw_major`: firmware version byte the TV uses to gate further commands
+- `fw_zone`: region zone byte
+- `battery_level`: 0-63, decoded from report byte 3
+- `scd`: the remote's sensor calibration blob as hex, empty until the remote
+  answers `F9 17`. Only the chunk index and the "more chunks" flag of the
+  response are documented, so the bytes are concatenated in arrival order and
+  passed through unparsed
 
 ## Calibration System
 
@@ -134,6 +172,61 @@ python3 convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
 - `mouse_k`: Airmouse sensitivity multiplier
 - `gyro_bias`: Gyroscope zero-offset values
 - `gyro_scale`: Gyroscope scaling factors
+
+## Voice Input
+
+The microphone is not autonomous: the host has to arm it by writing the vendor
+command `F9 03` to the remote, after which the remote sends 124-byte `0xFE`
+reports at 66.7 per second, each carrying two 60-byte HFP wideband blocks. Each
+block is an H2 header plus a 57-byte mSBC frame, so one report is 15 ms of
+16 kHz mono audio. This is a live stream, not a batched transfer, and the
+bridge adds one PipeWire quantum of buffering on top of the 15 ms packetisation.
+
+Decoding mSBC belongs in userspace, so `voice/lg-magic-voice` does the work: it
+reads the same hidraw node the kernel module leaves open, arms and re-arms the
+remote, decodes with `libsbc` and publishes a PipeWire source named
+`lg-magic-voice` carrying S16LE mono at 16 kHz. Any PipeWire or PulseAudio
+client can then record from it.
+
+### Building and running
+
+```bash
+cd voice
+make
+sudo make install                 # /usr/local/bin and a systemd user unit
+
+sudo cp ../52-lgmagic-hidraw.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
+
+systemctl --user enable --now lg-magic-voice.service
+```
+
+### Options
+
+```bash
+lg-magic-voice [-d /dev/hidrawN] [-m button|client|always] [-t ms] [-v]
+```
+
+- `-d`, `--device`: hidraw node of the remote; autodetected from
+  `HID_ID=0005:0000000F:00003412` by default
+- `-m`, `--mode`: when to arm the microphone
+  - `button` (default): while the microphone button is held, plus a tail
+  - `client`: whenever something is recording from the PipeWire source
+  - `always`: keep the stream armed
+- `-t`, `--tail`: how long to keep streaming after the button is released,
+  milliseconds (default 1500)
+- `-v`, `--verbose`: log state transitions
+
+### Recording
+
+```bash
+pw-record --target lg-magic-voice --rate 16000 --channels 1 --format s16 out.wav
+```
+
+The bridge re-sends `F9 05` every 4 s while armed, because the remote stops
+streaming by itself after about six seconds, and treats one second without an
+`0xFE` report as the stream having died. If the remote answers with the in-band
+stop code `0x800D` the stream is restarted while it is still wanted.
 
 ## Python Tools Usage
 
@@ -189,7 +282,18 @@ The remote uses report ID `0xFD` (30-byte total: 1 byte report ID + 29 bytes pay
 | 17-18 | 2 | Button code | big-endian uint16 |
 | 19 | 1 | Wheel delta | int8 |
 
-Other report types (0xF9, 0x01) were not observed, maybe used for other functions (like MIC)
+The remote declares report `0xF9` as input, output and feature (the vendor
+command channel), `0xFD` as input (motion and buttons) and `0xFE` as input
+(voice, 124 bytes: report ID, a status byte, a big-endian 16-bit event code in
+the same code space as the button field, then 120 bytes of audio as two 60-byte
+blocks).
+
+The vendor command channel `0xF9` carries a one-byte opcode after the report
+ID. The ones this project uses are `0x01` motion active, `0x02` motion sleep,
+`0x03`/`0x04`/`0x05` voice start, stop and restart, `0x11` read firmware
+version and `0x17` read sensor calibration data. Writing to the vendor GATT
+bank `d0ff` is a different matter entirely and must be avoided: writing `0x01`
+to characteristic `ffd1` reboots the remote into its DFU bootloader.
 
 ### IMU Data Processing
 - **Sampling rate**: ~50Hz (20ms intervals)
@@ -207,6 +311,9 @@ Other report types (0xF9, 0x01) were not observed, maybe used for other function
 - **Module**: `/lib/modules/$(uname -r)/kernel/drivers/input/misc/lg_magic.ko`
 - **Calibration**: `/lib/firmware/lg_magic_calib.bin`
 - **DKMS source**: `/usr/src/lg-magic-1.0/`
+- **Voice bridge**: `/usr/local/bin/lg-magic-voice`
+- **Udev rules**: `/etc/udev/rules.d/51-lgimu.rules`,
+  `/etc/udev/rules.d/52-lgmagic-hidraw.rules`
 
 ## Compatibility
 
@@ -214,6 +321,21 @@ Other report types (0xF9, 0x01) were not observed, maybe used for other function
 - **Kernel versions**: 4.15+ (tested on 6.11)
 - **Python**: 3.6+
 - **Dependencies**: numpy, scipy, pyqtgraph, python-evdev
+- **Voice bridge**: libsbc, libpipewire-0.3
+
+## Not Implemented
+
+Documented remote behaviour this project deliberately leaves alone:
+
+- The infrared transmitter and the UEI code-set commands (`0xF9` opcodes `0x50`
+  to `0x74`), which drive an external set-top box
+- `0xF9 0x19` remote information and `0xF9 0x90` liquid detection
+- Over-the-air firmware update over the `d0ff` GATT bank, which is one blind
+  write away from stranding the remote in its bootloader
+- Parsing the SCD blob into calibration values; the blob is exposed raw because
+  its layout is not published
+- The Broadcom generation (MR14 to MR16A), which is BR/EDR, identifies as
+  `0a5c:8502` and uses the incompatible 22-byte report `0xFA`
 
 ## Contributing
 
