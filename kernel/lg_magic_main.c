@@ -55,7 +55,7 @@ struct lgmagic_drvdata {
 
 	u16 last_keycode;
 	u16 last_btncode;
-	float gyro_acc[3];
+	s64 gyro_acc[3];
 	int mode;
 	struct lg_magic_airmouse_calib calib;
 };
@@ -230,9 +230,9 @@ static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagi
 	const struct firmware *fw;
 
 	ret = request_firmware(&fw, fwname, dev);
-	if (ret == 0 && fw->size>=sizeof(struct lg_magic_airmouse_calib)) {
+	if (ret == 0 && fw->size>=LGMAGIC_CALIB_SIZE) {
 		lgmagic_dev_info(dev, "Loading LG Magic calibration");
-		memcpy(&drvdata->calib, fw->data, sizeof(struct lg_magic_airmouse_calib));
+		lgmagic_convert_calib(&drvdata->calib, fw->data);
 		release_firmware(fw);
 		if (lgmagic_validate_calib(&drvdata->calib))
 		{
