@@ -147,9 +147,6 @@ static int lgmagic_hidraw_find(char *path, size_t size)
 		if (strncmp(ent->d_name, "hidraw", 6))
 			continue;
 
-		if (strlen(ent->d_name) + sizeof("/dev/") > size)
-			continue;
-
 		snprintf(line, sizeof(line),
 			 "/sys/class/hidraw/%s/device/uevent", ent->d_name);
 
@@ -168,7 +165,9 @@ static int lgmagic_hidraw_find(char *path, size_t size)
 		if (!hit)
 			continue;
 
-		snprintf(path, size, "/dev/%s", ent->d_name);
+		if (snprintf(path, size, "/dev/%s", ent->d_name) >= (int)size)
+			continue;
+
 		closedir(dir);
 
 		return 0;
