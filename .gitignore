@@ -16,3 +16,6 @@ modules.order
 __pycache__/
 *.py[codz]
 *$py.class
+
+# Voice bridge
+voice/lg-magic-voice
